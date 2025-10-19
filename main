@@ -1,0 +1,184 @@
+!pip install -q langchain langchain-community langchain-groq gradio faiss-cpu youtube-transcript-api sentence-transformers langchain_huggingface
+import gradio as gr
+import re
+import os
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+
+# NEW: Hugging Face chat model
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+# If you prefer local inference later, you can switch to:
+# from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
+
+
+# -------------------- 1. Utilities --------------------
+def get_video_id(url):
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
+    return match.group(1) if match else None
+
+
+def _join_segments_to_text(segments):
+    try:
+        return "\n".join(seg.get("text", "") for seg in segments if seg.get("text"))
+    except Exception:
+        return "\n".join(getattr(seg, "text", "") for seg in segments if getattr(seg, "text", ""))
+
+
+def fetch_transcript(url):
+    vid = get_video_id(url)
+    if not vid:
+        return "❌ Invalid YouTube URL."
+    try:
+        # Newer youtube-transcript-api versions use instance methods: .fetch() and .list()
+        # Older versions expose static methods: .get_transcript() and .list_transcripts()
+        ytt_api = YouTubeTranscriptApi()
+
+        # Try newest API first
+        try:
+            fetched = ytt_api.fetch(vid, languages=["en"])
+            # fetched may be a FetchedTranscript with .to_raw_data(), or an iterable of snippets
+            if hasattr(fetched, "to_raw_data"):
+                data = fetched.to_raw_data()
+            else:
+                data = list(fetched)
+            text = _join_segments_to_text(data)
+            if text.strip():
+                return text
+        except AttributeError:
+            # Fall back to older static API
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(vid)
+                # Prefer manually created English captions
+                for t in transcript_list:
+                    if getattr(t, "language_code", "").startswith("en") and not getattr(t, "is_generated", False):
+                        return _join_segments_to_text(t.fetch())
+                # Fallback to auto-generated English
+                for t in transcript_list:
+                    if getattr(t, "language_code", "").startswith("en") and getattr(t, "is_generated", False):
+                        return _join_segments_to_text(t.fetch())
+                # Final fallback: classic get_transcript
+                data = YouTubeTranscriptApi.get_transcript(vid, languages=["en"])
+                return _join_segments_to_text(data)
+            except AttributeError:
+                # Very old API that only supports get_transcript
+                data = YouTubeTranscriptApi.get_transcript(vid, languages=["en"])
+                return _join_segments_to_text(data)
+
+        # If English not available, try any language then join text
+        try:
+            transcript_list = ytt_api.list(vid)  # newest list() API
+            for t in transcript_list:
+                return _join_segments_to_text(t.fetch())
+        except Exception:
+            pass
+
+        return "❌ No transcript found."
+    except TranscriptsDisabled:
+        return "❌ Transcripts are disabled for this video."
+    except NoTranscriptFound:
+        return "❌ No transcript found."
+    except Exception as e:
+        return f"❌ Error fetching transcript: {e}"
+
+
+def chunk_text(text, chunk_size=400, chunk_overlap=40):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_text(text)
+
+
+# -------------------- 2. Models --------------------
+def get_llm():
+    """
+    Uses Hugging Face Inference API via HuggingFaceEndpoint and wraps it as a chat model.
+    Set HUGGINGFACEHUB_API_TOKEN (or login via huggingface_hub.login) to authenticate.
+    """
+    try:
+        llm = HuggingFaceEndpoint(
+            repo_id="HuggingFaceH4/zephyr-7b-beta",  # solid instruct model
+            task="text-generation",
+            max_new_tokens=512,
+            do_sample=False,
+            temperature=0.4,
+            repetition_penalty=1.03,
+            # provider="auto",  # optionally let HF choose a provider
+        )
+        return ChatHuggingFace(llm=llm, verbose=False)
+    except Exception:
+        # If you want fully local inference (optional), switch to the pipeline backend:
+        # try:
+        #     pipe = HuggingFacePipeline.from_model_id(
+        #         model_id="HuggingFaceH4/zephyr-7b-beta",
+        #         task="text-generation",
+        #         pipeline_kwargs=dict(
+        #             max_new_tokens=512,
+        #             do_sample=False,
+        #             temperature=0.4,
+        #             repetition_penalty=1.03,
+        #         ),
+        #     )
+        #     return ChatHuggingFace(llm=pipe, verbose=False)
+        # except Exception:
+        return None  # no LLM available
+
+
+def get_embedder():
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+
+# -------------------- 3. Prompts --------------------
+summary_prompt = PromptTemplate(
+    input_variables=["transcript"],
+    template="Summarize the YouTube transcript below in one concise paragraph:\n\n{transcript}"
+)
+
+qa_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="Answer the question based only on the context below.\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
+)
+
+
+# -------------------- 4. Functions --------------------
+def summarize_video(video_url):
+    transcript = fetch_transcript(video_url)
+    if "❌" in transcript:
+        return transcript
+    llm = get_llm()
+    if not llm:
+        return "ℹ️ Hugging Face not configured. Transcript fetched but summarization unavailable.\n\n" + transcript[:5000]
+    chain = LLMChain(llm=llm, prompt=summary_prompt, verbose=False)
+    return chain.run({"transcript": transcript})
+
+
+def answer_question(video_url, question):
+    transcript = fetch_transcript(video_url)
+    if "❌" in transcript:
+        return transcript
+    llm = get_llm()
+    if not llm:
+        return "ℹ️ Hugging Face not configured. Cannot answer questions. Transcript:\n\n" + transcript[:5000]
+
+    chunks = chunk_text(transcript)
+    embedder = get_embedder()
+    db = FAISS.from_texts(chunks, embedder)
+    docs = db.similarity_search(question, k=4)
+    context = "\n".join([d.page_content for d in docs])
+    chain = LLMChain(llm=llm, prompt=qa_prompt, verbose=False)
+    return chain.run({"context": context, "question": question})
+
+
+# -------------------- 5. Gradio UI --------------------
+with gr.Blocks() as demo:
+    gr.Markdown("<h2 style='text-align:center'>🎬 YouTube Transcript, Summarizer & Q&A</h2>")
+    url_input = gr.Textbox(label="YouTube Video URL")
+    summary_out = gr.Textbox(label="Summary / Transcript", lines=6)
+    question_input = gr.Textbox(label="Ask a Question about the video")
+    answer_out = gr.Textbox(label="Answer", lines=6)
+
+    gr.Button("Fetch & Summarize").click(summarize_video, inputs=url_input, outputs=summary_out)
+    gr.Button("Ask Question").click(answer_question, inputs=[url_input, question_input], outputs=answer_out)
+
+demo.launch(share=True, debug=True)
